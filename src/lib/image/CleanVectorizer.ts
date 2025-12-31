@@ -19,7 +19,7 @@ const BASELINE = 0;
 const BLUR_SIGMA = 0.8;        // Gaussian blur sigma for pre-trace smoothing
 const BLUR_THRESHOLD = 128;    // Re-threshold value after blur
 const DP_EPSILON = 0.6;        // Douglas-Peucker simplification epsilon (lower = more detail)
-const CURVE_SAMPLES = 8;       // Number of points to sample per curve segment
+const CURVE_SAMPLES = 12;      // Number of points to sample per curve segment
 
 // ============================================================================
 // PRE-TRACE BITMAP SMOOTHING
@@ -257,19 +257,59 @@ function parseSvgPathToPoints(d: string): Point[][] {
 }
 
 /**
- * Convert simplified points back to SVG path
+ * Convert simplified points back to SVG path using quadratic curves
+ * Uses "midpoint quadratic" smoothing for natural handwriting look
  */
 function pointsToSvgPath(contours: Point[][]): string {
   let path = '';
+  const CLOSE_THRESHOLD = 2.5; // If start/end within this distance, treat as closed
 
   for (const contour of contours) {
     if (contour.length === 0) continue;
-
-    path += `M ${contour[0].x.toFixed(2)} ${contour[0].y.toFixed(2)} `;
-    for (let i = 1; i < contour.length; i++) {
-      path += `L ${contour[i].x.toFixed(2)} ${contour[i].y.toFixed(2)} `;
+    if (contour.length === 1) {
+      // Single point - skip
+      continue;
     }
-    path += 'Z ';
+
+    const p = contour;
+    const n = p.length;
+
+    // Check if contour should be closed
+    const dx = p[0].x - p[n - 1].x;
+    const dy = p[0].y - p[n - 1].y;
+    const isClosed = Math.sqrt(dx * dx + dy * dy) <= CLOSE_THRESHOLD;
+
+    // Start path
+    path += `M ${p[0].x.toFixed(2)} ${p[0].y.toFixed(2)} `;
+
+    if (n === 2) {
+      // Just two points - use line
+      path += `L ${p[1].x.toFixed(2)} ${p[1].y.toFixed(2)} `;
+    } else {
+      // Midpoint quadratic smoothing:
+      // For each point p[i] (except first and last), use it as control point
+      // and the midpoint between p[i] and p[i+1] as the endpoint
+
+      for (let i = 1; i < n - 1; i++) {
+        const ctrl = p[i];
+        const next = p[i + 1];
+        // Midpoint between control and next point
+        const midX = (ctrl.x + next.x) / 2;
+        const midY = (ctrl.y + next.y) / 2;
+        path += `Q ${ctrl.x.toFixed(2)} ${ctrl.y.toFixed(2)} ${midX.toFixed(2)} ${midY.toFixed(2)} `;
+      }
+
+      // Final segment to the last point
+      // Use second-to-last point as control, last point as endpoint
+      const lastCtrl = p[n - 2];
+      const lastPt = p[n - 1];
+      path += `Q ${lastCtrl.x.toFixed(2)} ${lastCtrl.y.toFixed(2)} ${lastPt.x.toFixed(2)} ${lastPt.y.toFixed(2)} `;
+    }
+
+    // Close path only if it's actually a closed contour
+    if (isClosed) {
+      path += 'Z ';
+    }
   }
 
   return path.trim();
