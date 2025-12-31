@@ -16,9 +16,10 @@ const DESCENDER = -200;
 const BASELINE = 0;
 
 // Smoothing parameters (tunable)
-const BLUR_SIGMA = 1.0;        // Gaussian blur sigma for pre-trace smoothing
+const BLUR_SIGMA = 0.8;        // Gaussian blur sigma for pre-trace smoothing
 const BLUR_THRESHOLD = 128;    // Re-threshold value after blur
-const DP_EPSILON = 1.2;        // Douglas-Peucker simplification epsilon
+const DP_EPSILON = 0.6;        // Douglas-Peucker simplification epsilon (lower = more detail)
+const CURVE_SAMPLES = 8;       // Number of points to sample per curve segment
 
 // ============================================================================
 // PRE-TRACE BITMAP SMOOTHING
@@ -63,13 +64,62 @@ function smoothBinaryMask(imageData: ImageData, sigma: number = BLUR_SIGMA): Ima
 }
 
 // ============================================================================
-// POST-TRACE PATH SIMPLIFICATION (Douglas-Peucker)
+// CURVE SAMPLING UTILITIES
 // ============================================================================
 
 interface Point {
   x: number;
   y: number;
 }
+
+/**
+ * Sample points along a quadratic bezier curve
+ * Q command: control point (cx, cy), end point (ex, ey)
+ */
+function sampleQuadraticBezier(
+  sx: number, sy: number,  // start point
+  cx: number, cy: number,  // control point
+  ex: number, ey: number,  // end point
+  numSamples: number
+): Point[] {
+  const points: Point[] = [];
+  for (let i = 1; i <= numSamples; i++) {
+    const t = i / numSamples;
+    const mt = 1 - t;
+    // B(t) = (1-t)²P0 + 2(1-t)tP1 + t²P2
+    const x = mt * mt * sx + 2 * mt * t * cx + t * t * ex;
+    const y = mt * mt * sy + 2 * mt * t * cy + t * t * ey;
+    points.push({ x, y });
+  }
+  return points;
+}
+
+/**
+ * Sample points along a cubic bezier curve
+ * C command: control1 (c1x, c1y), control2 (c2x, c2y), end point (ex, ey)
+ */
+function sampleCubicBezier(
+  sx: number, sy: number,    // start point
+  c1x: number, c1y: number,  // control point 1
+  c2x: number, c2y: number,  // control point 2
+  ex: number, ey: number,    // end point
+  numSamples: number
+): Point[] {
+  const points: Point[] = [];
+  for (let i = 1; i <= numSamples; i++) {
+    const t = i / numSamples;
+    const mt = 1 - t;
+    // B(t) = (1-t)³P0 + 3(1-t)²tP1 + 3(1-t)t²P2 + t³P3
+    const x = mt * mt * mt * sx + 3 * mt * mt * t * c1x + 3 * mt * t * t * c2x + t * t * t * ex;
+    const y = mt * mt * mt * sy + 3 * mt * mt * t * c1y + 3 * mt * t * t * c2y + t * t * t * ey;
+    points.push({ x, y });
+  }
+  return points;
+}
+
+// ============================================================================
+// POST-TRACE PATH SIMPLIFICATION (Douglas-Peucker)
+// ============================================================================
 
 /**
  * Douglas-Peucker line simplification
@@ -168,18 +218,27 @@ function parseSvgPathToPoints(d: string): Point[][] {
         currentY = args[0];
         currentContour.push({ x: currentX, y: currentY });
         break;
-      case 'C':
-        // Cubic bezier - just take endpoint
-        currentX = args[4];
-        currentY = args[5];
-        currentContour.push({ x: currentX, y: currentY });
+      case 'C': {
+        // Cubic bezier - sample points along curve
+        const c1x = args[0], c1y = args[1];
+        const c2x = args[2], c2y = args[3];
+        const cex = args[4], cey = args[5];
+        const cubicPts = sampleCubicBezier(currentX, currentY, c1x, c1y, c2x, c2y, cex, cey, CURVE_SAMPLES);
+        currentContour.push(...cubicPts);
+        currentX = cex;
+        currentY = cey;
         break;
-      case 'Q':
-        // Quadratic bezier - just take endpoint
-        currentX = args[2];
-        currentY = args[3];
-        currentContour.push({ x: currentX, y: currentY });
+      }
+      case 'Q': {
+        // Quadratic bezier - sample points along curve
+        const qcx = args[0], qcy = args[1];
+        const qex = args[2], qey = args[3];
+        const quadPts = sampleQuadraticBezier(currentX, currentY, qcx, qcy, qex, qey, CURVE_SAMPLES);
+        currentContour.push(...quadPts);
+        currentX = qex;
+        currentY = qey;
         break;
+      }
       case 'Z':
       case 'z':
         if (currentContour.length > 0) {
