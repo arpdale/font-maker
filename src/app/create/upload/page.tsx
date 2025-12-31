@@ -9,6 +9,7 @@ import { useFontStore } from '@/stores/fontStore';
 import { processTemplatePage, type ProcessingResult } from '@/lib/image/TemplateProcessor';
 import { getTemplateCoordinates, DEFAULT_TEMPLATE_CONFIG } from '@/lib/template/TemplateDefinition';
 import { ProcessingDebugOverlay } from '@/components/debug/ProcessingDebugOverlay';
+import { MonolineDebugView } from '@/components/debug/MonolineDebugView';
 import type { PdfPage } from '@/lib/image/PdfParser';
 import { ALL_CHARACTERS } from '@/lib/constants/characters';
 import {
@@ -55,6 +56,7 @@ export default function UploadPage() {
   // Debug state
   const [processingResult, setProcessingResult] = useState<ProcessingResult | null>(null);
   const [originalImageData, setOriginalImageData] = useState<ImageData | null>(null);
+  const [selectedGlyphIndex, setSelectedGlyphIndex] = useState(0);
 
   const canvasRef = useRef<HTMLCanvasElement>(null);
   const fileInputRef = useRef<HTMLInputElement>(null);
@@ -509,6 +511,34 @@ export default function UploadPage() {
               thresholdedImage={processingResult.debugImages.thresholded}
               markers={processingResult.markers}
               templateCoords={templateCoords}
+            />
+          </div>
+        )}
+
+        {/* Monoline Debug View */}
+        {processingResult && processingResult.glyphs.length > 0 && (
+          <div className="mt-8">
+            {/* Glyph selector */}
+            <div className="mb-4 flex items-center gap-4">
+              <label className="text-sm font-medium text-neutral-700">
+                Debug Glyph:
+              </label>
+              <select
+                value={selectedGlyphIndex}
+                onChange={(e) => setSelectedGlyphIndex(Number(e.target.value))}
+                className="px-3 py-2 border border-neutral-300 rounded-md text-sm bg-white"
+              >
+                {processingResult.glyphs.map((glyph, idx) => (
+                  <option key={idx} value={idx}>
+                    {glyph.character.character} ({glyph.character.name})
+                  </option>
+                ))}
+              </select>
+            </div>
+
+            <MonolineDebugView
+              cellMask={processingResult.glyphs[selectedGlyphIndex]?.cleanedImageData ?? null}
+              character={processingResult.glyphs[selectedGlyphIndex]?.character.character}
             />
           </div>
         )}
