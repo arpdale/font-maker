@@ -15,6 +15,315 @@ const ASCENDER = 800;
 const DESCENDER = -200;
 const BASELINE = 0;
 
+// Smoothing parameters (tunable)
+const BLUR_SIGMA = 0.8;        // Gaussian blur sigma for pre-trace smoothing
+const BLUR_THRESHOLD = 128;    // Re-threshold value after blur
+const DP_EPSILON = 0.6;        // Douglas-Peucker simplification epsilon (lower = more detail)
+const CURVE_SAMPLES = 12;      // Number of points to sample per curve segment
+
+// ============================================================================
+// PRE-TRACE BITMAP SMOOTHING
+// ============================================================================
+
+/**
+ * Smooth a binary mask using Canvas 2D blur filter + re-threshold
+ * This reduces stair-step edges before vectorization
+ *
+ * Uses the browser's native blur filter which is GPU-accelerated
+ */
+function smoothBinaryMask(imageData: ImageData, sigma: number = BLUR_SIGMA): ImageData {
+  const { width, height } = imageData;
+
+  // Draw ImageData to canvas
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d')!;
+  ctx.putImageData(imageData, 0, 0);
+
+  // Apply Gaussian blur using Canvas 2D filter
+  ctx.filter = `blur(${sigma}px)`;
+  ctx.drawImage(canvas, 0, 0);
+  ctx.filter = 'none';
+
+  // Read back blurred data
+  const blurred = ctx.getImageData(0, 0, width, height);
+  const d = blurred.data;
+
+  // Re-threshold to binary (ink=white, bg=black)
+  for (let i = 0; i < d.length; i += 4) {
+    const v = d[i]; // grayscale assumed (R channel)
+    const out = v > BLUR_THRESHOLD ? 255 : 0;
+    d[i] = out;
+    d[i + 1] = out;
+    d[i + 2] = out;
+    d[i + 3] = 255;
+  }
+
+  return blurred;
+}
+
+// ============================================================================
+// CURVE SAMPLING UTILITIES
+// ============================================================================
+
+interface Point {
+  x: number;
+  y: number;
+}
+
+/**
+ * Sample points along a quadratic bezier curve
+ * Q command: control point (cx, cy), end point (ex, ey)
+ */
+function sampleQuadraticBezier(
+  sx: number, sy: number,  // start point
+  cx: number, cy: number,  // control point
+  ex: number, ey: number,  // end point
+  numSamples: number
+): Point[] {
+  const points: Point[] = [];
+  for (let i = 1; i <= numSamples; i++) {
+    const t = i / numSamples;
+    const mt = 1 - t;
+    // B(t) = (1-t)²P0 + 2(1-t)tP1 + t²P2
+    const x = mt * mt * sx + 2 * mt * t * cx + t * t * ex;
+    const y = mt * mt * sy + 2 * mt * t * cy + t * t * ey;
+    points.push({ x, y });
+  }
+  return points;
+}
+
+/**
+ * Sample points along a cubic bezier curve
+ * C command: control1 (c1x, c1y), control2 (c2x, c2y), end point (ex, ey)
+ */
+function sampleCubicBezier(
+  sx: number, sy: number,    // start point
+  c1x: number, c1y: number,  // control point 1
+  c2x: number, c2y: number,  // control point 2
+  ex: number, ey: number,    // end point
+  numSamples: number
+): Point[] {
+  const points: Point[] = [];
+  for (let i = 1; i <= numSamples; i++) {
+    const t = i / numSamples;
+    const mt = 1 - t;
+    // B(t) = (1-t)³P0 + 3(1-t)²tP1 + 3(1-t)t²P2 + t³P3
+    const x = mt * mt * mt * sx + 3 * mt * mt * t * c1x + 3 * mt * t * t * c2x + t * t * t * ex;
+    const y = mt * mt * mt * sy + 3 * mt * mt * t * c1y + 3 * mt * t * t * c2y + t * t * t * ey;
+    points.push({ x, y });
+  }
+  return points;
+}
+
+// ============================================================================
+// POST-TRACE PATH SIMPLIFICATION (Douglas-Peucker)
+// ============================================================================
+
+/**
+ * Douglas-Peucker line simplification
+ * Removes points that don't contribute significantly to the shape
+ */
+function simplifyPath(points: Point[], epsilon: number): Point[] {
+  if (points.length <= 2) return points;
+
+  // Find the point with maximum distance from the line between first and last
+  let maxDist = 0;
+  let maxIndex = 0;
+
+  const first = points[0];
+  const last = points[points.length - 1];
+
+  for (let i = 1; i < points.length - 1; i++) {
+    const dist = perpendicularDistance(points[i], first, last);
+    if (dist > maxDist) {
+      maxDist = dist;
+      maxIndex = i;
+    }
+  }
+
+  // If max distance is greater than epsilon, recursively simplify
+  if (maxDist > epsilon) {
+    const left = simplifyPath(points.slice(0, maxIndex + 1), epsilon);
+    const right = simplifyPath(points.slice(maxIndex), epsilon);
+    return [...left.slice(0, -1), ...right];
+  } else {
+    return [first, last];
+  }
+}
+
+/**
+ * Calculate perpendicular distance from point to line segment
+ */
+function perpendicularDistance(point: Point, lineStart: Point, lineEnd: Point): number {
+  const dx = lineEnd.x - lineStart.x;
+  const dy = lineEnd.y - lineStart.y;
+
+  const lineLengthSq = dx * dx + dy * dy;
+
+  if (lineLengthSq === 0) {
+    // Line is a point
+    return Math.sqrt((point.x - lineStart.x) ** 2 + (point.y - lineStart.y) ** 2);
+  }
+
+  // Calculate perpendicular distance using cross product
+  const cross = Math.abs(
+    (lineEnd.y - lineStart.y) * point.x -
+    (lineEnd.x - lineStart.x) * point.y +
+    lineEnd.x * lineStart.y -
+    lineEnd.y * lineStart.x
+  );
+
+  return cross / Math.sqrt(lineLengthSq);
+}
+
+/**
+ * Parse SVG path d attribute into array of points (only handles M, L, and Z commands)
+ * For simplification purposes, we treat curves as their endpoint
+ */
+function parseSvgPathToPoints(d: string): Point[][] {
+  const contours: Point[][] = [];
+  let currentContour: Point[] = [];
+
+  const cmdRegex = /([MmLlHhVvCcSsQqTtAaZz])([^MmLlHhVvCcSsQqTtAaZz]*)/g;
+  let match;
+  let currentX = 0, currentY = 0;
+
+  while ((match = cmdRegex.exec(d)) !== null) {
+    const cmd = match[1];
+    const argsStr = match[2].trim();
+    const args = argsStr.split(/[\s,]+/).filter(s => s.length > 0).map(parseFloat);
+
+    switch (cmd) {
+      case 'M':
+        if (currentContour.length > 0) {
+          contours.push(currentContour);
+          currentContour = [];
+        }
+        currentX = args[0];
+        currentY = args[1];
+        currentContour.push({ x: currentX, y: currentY });
+        break;
+      case 'L':
+        currentX = args[0];
+        currentY = args[1];
+        currentContour.push({ x: currentX, y: currentY });
+        break;
+      case 'H':
+        currentX = args[0];
+        currentContour.push({ x: currentX, y: currentY });
+        break;
+      case 'V':
+        currentY = args[0];
+        currentContour.push({ x: currentX, y: currentY });
+        break;
+      case 'C': {
+        // Cubic bezier - sample points along curve
+        const c1x = args[0], c1y = args[1];
+        const c2x = args[2], c2y = args[3];
+        const cex = args[4], cey = args[5];
+        const cubicPts = sampleCubicBezier(currentX, currentY, c1x, c1y, c2x, c2y, cex, cey, CURVE_SAMPLES);
+        currentContour.push(...cubicPts);
+        currentX = cex;
+        currentY = cey;
+        break;
+      }
+      case 'Q': {
+        // Quadratic bezier - sample points along curve
+        const qcx = args[0], qcy = args[1];
+        const qex = args[2], qey = args[3];
+        const quadPts = sampleQuadraticBezier(currentX, currentY, qcx, qcy, qex, qey, CURVE_SAMPLES);
+        currentContour.push(...quadPts);
+        currentX = qex;
+        currentY = qey;
+        break;
+      }
+      case 'Z':
+      case 'z':
+        if (currentContour.length > 0) {
+          contours.push(currentContour);
+          currentContour = [];
+        }
+        break;
+    }
+  }
+
+  if (currentContour.length > 0) {
+    contours.push(currentContour);
+  }
+
+  return contours;
+}
+
+/**
+ * Convert simplified points back to SVG path using quadratic curves
+ * Uses "midpoint quadratic" smoothing for natural handwriting look
+ */
+function pointsToSvgPath(contours: Point[][]): string {
+  let path = '';
+  const CLOSE_THRESHOLD = 2.5; // If start/end within this distance, treat as closed
+
+  for (const contour of contours) {
+    if (contour.length === 0) continue;
+    if (contour.length === 1) {
+      // Single point - skip
+      continue;
+    }
+
+    const p = contour;
+    const n = p.length;
+
+    // Check if contour should be closed
+    const dx = p[0].x - p[n - 1].x;
+    const dy = p[0].y - p[n - 1].y;
+    const isClosed = Math.sqrt(dx * dx + dy * dy) <= CLOSE_THRESHOLD;
+
+    // Start path
+    path += `M ${p[0].x.toFixed(2)} ${p[0].y.toFixed(2)} `;
+
+    if (n === 2) {
+      // Just two points - use line
+      path += `L ${p[1].x.toFixed(2)} ${p[1].y.toFixed(2)} `;
+    } else {
+      // Midpoint quadratic smoothing:
+      // For each point p[i] (except first and last), use it as control point
+      // and the midpoint between p[i] and p[i+1] as the endpoint
+
+      for (let i = 1; i < n - 1; i++) {
+        const ctrl = p[i];
+        const next = p[i + 1];
+        // Midpoint between control and next point
+        const midX = (ctrl.x + next.x) / 2;
+        const midY = (ctrl.y + next.y) / 2;
+        path += `Q ${ctrl.x.toFixed(2)} ${ctrl.y.toFixed(2)} ${midX.toFixed(2)} ${midY.toFixed(2)} `;
+      }
+
+      // Final segment to the last point
+      // Use second-to-last point as control, last point as endpoint
+      const lastCtrl = p[n - 2];
+      const lastPt = p[n - 1];
+      path += `Q ${lastCtrl.x.toFixed(2)} ${lastCtrl.y.toFixed(2)} ${lastPt.x.toFixed(2)} ${lastPt.y.toFixed(2)} `;
+    }
+
+    // Close path only if it's actually a closed contour
+    if (isClosed) {
+      path += 'Z ';
+    }
+  }
+
+  return path.trim();
+}
+
+/**
+ * Apply Douglas-Peucker simplification to an SVG path string
+ */
+function simplifySvgPath(d: string, epsilon: number = DP_EPSILON): string {
+  const contours = parseSvgPathToPoints(d);
+  const simplified = contours.map(c => simplifyPath(c, epsilon));
+  return pointsToSvgPath(simplified);
+}
+
 export interface VectorizationResult {
   svgPath: string;
   bounds: {
@@ -93,8 +402,12 @@ export function vectorizeCell(cellImageData: ImageData): VectorizationResult {
 
   const croppedData = croppedCtx.getImageData(0, 0, bounds.width, bounds.height);
 
+  // PRE-TRACE SMOOTHING: Apply Gaussian blur + re-threshold to reduce stair-step edges
+  const smoothedData = smoothBinaryMask(croppedData, BLUR_SIGMA);
+  console.log('[CleanVectorizer] Applied pre-trace smoothing (sigma=' + BLUR_SIGMA + ')');
+
   // Trace with imagetracerjs
-  // Options tuned for handwriting
+  // Options tuned for handwriting (blur disabled since we handle it upstream)
   const traceOptions = {
     ltres: 1,        // Line threshold
     qtres: 2,        // Quadratic spline threshold (slightly higher for smoother curves)
@@ -116,7 +429,7 @@ export function vectorizeCell(cellImageData: ImageData): VectorizationResult {
   };
 
   try {
-    const svgString = ImageTracer.imagedataToSVG(croppedData, traceOptions);
+    const svgString = ImageTracer.imagedataToSVG(smoothedData, traceOptions);
 
     // DEBUG: Log raw SVG for inspection
     console.log('[CleanVectorizer] Raw SVG from imagetracer:', svgString.substring(0, 500));
@@ -227,14 +540,31 @@ function extractPathFromSvg(svgString: string, imageWidth: number, imageHeight: 
   }
 
   console.log(`[CleanVectorizer] Outlines: ${outlines.length}, Holes: ${holes.length}, Rejected: ${rejected.length}`);
-  console.log(`[CleanVectorizer] ===================================`);
 
   document.body.removeChild(temp);
+
+  // POST-TRACE SIMPLIFICATION: Apply Douglas-Peucker to reduce micro-vertices
+  // Apply separately to outlines and holes to preserve topology
+  const simplifiedOutlines = outlines.map(d => {
+    const before = d.length;
+    const simplified = simplifySvgPath(d, DP_EPSILON);
+    console.log(`[CleanVectorizer] Simplified outline: ${before} chars → ${simplified.length} chars`);
+    return simplified;
+  });
+
+  const simplifiedHoles = holes.map(d => {
+    const before = d.length;
+    const simplified = simplifySvgPath(d, DP_EPSILON);
+    console.log(`[CleanVectorizer] Simplified hole: ${before} chars → ${simplified.length} chars`);
+    return simplified;
+  });
+
+  console.log(`[CleanVectorizer] ===================================`);
 
   // Return structured data so PathConverter can handle winding correctly
   // Format: outlines first, then holes, separated by a marker
   // We'll use a special format that PathConverter can parse
-  return JSON.stringify({ outlines, holes });
+  return JSON.stringify({ outlines: simplifiedOutlines, holes: simplifiedHoles });
 }
 
 function isWhiteColor(color: string): boolean {
