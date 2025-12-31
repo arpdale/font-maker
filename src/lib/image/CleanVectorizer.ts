@@ -25,81 +25,41 @@ const DP_EPSILON = 1.2;        // Douglas-Peucker simplification epsilon
 // ============================================================================
 
 /**
- * Smooth a binary mask using Gaussian blur + re-threshold
+ * Smooth a binary mask using Canvas 2D blur filter + re-threshold
  * This reduces stair-step edges before vectorization
+ *
+ * Uses the browser's native blur filter which is GPU-accelerated
  */
 function smoothBinaryMask(imageData: ImageData, sigma: number = BLUR_SIGMA): ImageData {
-  const { width, height, data } = imageData;
+  const { width, height } = imageData;
 
-  // Create grayscale buffer from input
-  const gray = new Float32Array(width * height);
-  for (let i = 0; i < gray.length; i++) {
-    gray[i] = data[i * 4]; // Just take R channel (binary, so R=G=B)
+  // Draw ImageData to canvas
+  const canvas = document.createElement('canvas');
+  canvas.width = width;
+  canvas.height = height;
+  const ctx = canvas.getContext('2d')!;
+  ctx.putImageData(imageData, 0, 0);
+
+  // Apply Gaussian blur using Canvas 2D filter
+  ctx.filter = `blur(${sigma}px)`;
+  ctx.drawImage(canvas, 0, 0);
+  ctx.filter = 'none';
+
+  // Read back blurred data
+  const blurred = ctx.getImageData(0, 0, width, height);
+  const d = blurred.data;
+
+  // Re-threshold to binary (ink=white, bg=black)
+  for (let i = 0; i < d.length; i += 4) {
+    const v = d[i]; // grayscale assumed (R channel)
+    const out = v > BLUR_THRESHOLD ? 255 : 0;
+    d[i] = out;
+    d[i + 1] = out;
+    d[i + 2] = out;
+    d[i + 3] = 255;
   }
 
-  // Apply Gaussian blur
-  const blurred = gaussianBlur(gray, width, height, sigma);
-
-  // Re-threshold to get clean binary
-  const result = new ImageData(width, height);
-  for (let i = 0; i < blurred.length; i++) {
-    const val = blurred[i] > BLUR_THRESHOLD ? 255 : 0;
-    result.data[i * 4] = val;
-    result.data[i * 4 + 1] = val;
-    result.data[i * 4 + 2] = val;
-    result.data[i * 4 + 3] = 255;
-  }
-
-  return result;
-}
-
-/**
- * Gaussian blur using separable convolution
- */
-function gaussianBlur(input: Float32Array, width: number, height: number, sigma: number): Float32Array {
-  // Generate 1D Gaussian kernel
-  const kernelSize = Math.ceil(sigma * 3) * 2 + 1;
-  const kernel = new Float32Array(kernelSize);
-  const halfSize = Math.floor(kernelSize / 2);
-
-  let sum = 0;
-  for (let i = 0; i < kernelSize; i++) {
-    const x = i - halfSize;
-    kernel[i] = Math.exp(-(x * x) / (2 * sigma * sigma));
-    sum += kernel[i];
-  }
-  // Normalize kernel
-  for (let i = 0; i < kernelSize; i++) {
-    kernel[i] /= sum;
-  }
-
-  // Horizontal pass
-  const temp = new Float32Array(width * height);
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      let val = 0;
-      for (let k = 0; k < kernelSize; k++) {
-        const sx = Math.min(Math.max(x + k - halfSize, 0), width - 1);
-        val += input[y * width + sx] * kernel[k];
-      }
-      temp[y * width + x] = val;
-    }
-  }
-
-  // Vertical pass
-  const output = new Float32Array(width * height);
-  for (let y = 0; y < height; y++) {
-    for (let x = 0; x < width; x++) {
-      let val = 0;
-      for (let k = 0; k < kernelSize; k++) {
-        const sy = Math.min(Math.max(y + k - halfSize, 0), height - 1);
-        val += temp[sy * width + x] * kernel[k];
-      }
-      output[y * width + x] = val;
-    }
-  }
-
-  return output;
+  return blurred;
 }
 
 // ============================================================================
