@@ -15,6 +15,256 @@ const ASCENDER = 800;
 const DESCENDER = -200;
 const BASELINE = 0;
 
+// Smoothing parameters (tunable)
+const BLUR_SIGMA = 1.0;        // Gaussian blur sigma for pre-trace smoothing
+const BLUR_THRESHOLD = 128;    // Re-threshold value after blur
+const DP_EPSILON = 1.2;        // Douglas-Peucker simplification epsilon
+
+// ============================================================================
+// PRE-TRACE BITMAP SMOOTHING
+// ============================================================================
+
+/**
+ * Smooth a binary mask using Gaussian blur + re-threshold
+ * This reduces stair-step edges before vectorization
+ */
+function smoothBinaryMask(imageData: ImageData, sigma: number = BLUR_SIGMA): ImageData {
+  const { width, height, data } = imageData;
+
+  // Create grayscale buffer from input
+  const gray = new Float32Array(width * height);
+  for (let i = 0; i < gray.length; i++) {
+    gray[i] = data[i * 4]; // Just take R channel (binary, so R=G=B)
+  }
+
+  // Apply Gaussian blur
+  const blurred = gaussianBlur(gray, width, height, sigma);
+
+  // Re-threshold to get clean binary
+  const result = new ImageData(width, height);
+  for (let i = 0; i < blurred.length; i++) {
+    const val = blurred[i] > BLUR_THRESHOLD ? 255 : 0;
+    result.data[i * 4] = val;
+    result.data[i * 4 + 1] = val;
+    result.data[i * 4 + 2] = val;
+    result.data[i * 4 + 3] = 255;
+  }
+
+  return result;
+}
+
+/**
+ * Gaussian blur using separable convolution
+ */
+function gaussianBlur(input: Float32Array, width: number, height: number, sigma: number): Float32Array {
+  // Generate 1D Gaussian kernel
+  const kernelSize = Math.ceil(sigma * 3) * 2 + 1;
+  const kernel = new Float32Array(kernelSize);
+  const halfSize = Math.floor(kernelSize / 2);
+
+  let sum = 0;
+  for (let i = 0; i < kernelSize; i++) {
+    const x = i - halfSize;
+    kernel[i] = Math.exp(-(x * x) / (2 * sigma * sigma));
+    sum += kernel[i];
+  }
+  // Normalize kernel
+  for (let i = 0; i < kernelSize; i++) {
+    kernel[i] /= sum;
+  }
+
+  // Horizontal pass
+  const temp = new Float32Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      let val = 0;
+      for (let k = 0; k < kernelSize; k++) {
+        const sx = Math.min(Math.max(x + k - halfSize, 0), width - 1);
+        val += input[y * width + sx] * kernel[k];
+      }
+      temp[y * width + x] = val;
+    }
+  }
+
+  // Vertical pass
+  const output = new Float32Array(width * height);
+  for (let y = 0; y < height; y++) {
+    for (let x = 0; x < width; x++) {
+      let val = 0;
+      for (let k = 0; k < kernelSize; k++) {
+        const sy = Math.min(Math.max(y + k - halfSize, 0), height - 1);
+        val += temp[sy * width + x] * kernel[k];
+      }
+      output[y * width + x] = val;
+    }
+  }
+
+  return output;
+}
+
+// ============================================================================
+// POST-TRACE PATH SIMPLIFICATION (Douglas-Peucker)
+// ============================================================================
+
+interface Point {
+  x: number;
+  y: number;
+}
+
+/**
+ * Douglas-Peucker line simplification
+ * Removes points that don't contribute significantly to the shape
+ */
+function simplifyPath(points: Point[], epsilon: number): Point[] {
+  if (points.length <= 2) return points;
+
+  // Find the point with maximum distance from the line between first and last
+  let maxDist = 0;
+  let maxIndex = 0;
+
+  const first = points[0];
+  const last = points[points.length - 1];
+
+  for (let i = 1; i < points.length - 1; i++) {
+    const dist = perpendicularDistance(points[i], first, last);
+    if (dist > maxDist) {
+      maxDist = dist;
+      maxIndex = i;
+    }
+  }
+
+  // If max distance is greater than epsilon, recursively simplify
+  if (maxDist > epsilon) {
+    const left = simplifyPath(points.slice(0, maxIndex + 1), epsilon);
+    const right = simplifyPath(points.slice(maxIndex), epsilon);
+    return [...left.slice(0, -1), ...right];
+  } else {
+    return [first, last];
+  }
+}
+
+/**
+ * Calculate perpendicular distance from point to line segment
+ */
+function perpendicularDistance(point: Point, lineStart: Point, lineEnd: Point): number {
+  const dx = lineEnd.x - lineStart.x;
+  const dy = lineEnd.y - lineStart.y;
+
+  const lineLengthSq = dx * dx + dy * dy;
+
+  if (lineLengthSq === 0) {
+    // Line is a point
+    return Math.sqrt((point.x - lineStart.x) ** 2 + (point.y - lineStart.y) ** 2);
+  }
+
+  // Calculate perpendicular distance using cross product
+  const cross = Math.abs(
+    (lineEnd.y - lineStart.y) * point.x -
+    (lineEnd.x - lineStart.x) * point.y +
+    lineEnd.x * lineStart.y -
+    lineEnd.y * lineStart.x
+  );
+
+  return cross / Math.sqrt(lineLengthSq);
+}
+
+/**
+ * Parse SVG path d attribute into array of points (only handles M, L, and Z commands)
+ * For simplification purposes, we treat curves as their endpoint
+ */
+function parseSvgPathToPoints(d: string): Point[][] {
+  const contours: Point[][] = [];
+  let currentContour: Point[] = [];
+
+  const cmdRegex = /([MmLlHhVvCcSsQqTtAaZz])([^MmLlHhVvCcSsQqTtAaZz]*)/g;
+  let match;
+  let currentX = 0, currentY = 0;
+
+  while ((match = cmdRegex.exec(d)) !== null) {
+    const cmd = match[1];
+    const argsStr = match[2].trim();
+    const args = argsStr.split(/[\s,]+/).filter(s => s.length > 0).map(parseFloat);
+
+    switch (cmd) {
+      case 'M':
+        if (currentContour.length > 0) {
+          contours.push(currentContour);
+          currentContour = [];
+        }
+        currentX = args[0];
+        currentY = args[1];
+        currentContour.push({ x: currentX, y: currentY });
+        break;
+      case 'L':
+        currentX = args[0];
+        currentY = args[1];
+        currentContour.push({ x: currentX, y: currentY });
+        break;
+      case 'H':
+        currentX = args[0];
+        currentContour.push({ x: currentX, y: currentY });
+        break;
+      case 'V':
+        currentY = args[0];
+        currentContour.push({ x: currentX, y: currentY });
+        break;
+      case 'C':
+        // Cubic bezier - just take endpoint
+        currentX = args[4];
+        currentY = args[5];
+        currentContour.push({ x: currentX, y: currentY });
+        break;
+      case 'Q':
+        // Quadratic bezier - just take endpoint
+        currentX = args[2];
+        currentY = args[3];
+        currentContour.push({ x: currentX, y: currentY });
+        break;
+      case 'Z':
+      case 'z':
+        if (currentContour.length > 0) {
+          contours.push(currentContour);
+          currentContour = [];
+        }
+        break;
+    }
+  }
+
+  if (currentContour.length > 0) {
+    contours.push(currentContour);
+  }
+
+  return contours;
+}
+
+/**
+ * Convert simplified points back to SVG path
+ */
+function pointsToSvgPath(contours: Point[][]): string {
+  let path = '';
+
+  for (const contour of contours) {
+    if (contour.length === 0) continue;
+
+    path += `M ${contour[0].x.toFixed(2)} ${contour[0].y.toFixed(2)} `;
+    for (let i = 1; i < contour.length; i++) {
+      path += `L ${contour[i].x.toFixed(2)} ${contour[i].y.toFixed(2)} `;
+    }
+    path += 'Z ';
+  }
+
+  return path.trim();
+}
+
+/**
+ * Apply Douglas-Peucker simplification to an SVG path string
+ */
+function simplifySvgPath(d: string, epsilon: number = DP_EPSILON): string {
+  const contours = parseSvgPathToPoints(d);
+  const simplified = contours.map(c => simplifyPath(c, epsilon));
+  return pointsToSvgPath(simplified);
+}
+
 export interface VectorizationResult {
   svgPath: string;
   bounds: {
@@ -93,8 +343,12 @@ export function vectorizeCell(cellImageData: ImageData): VectorizationResult {
 
   const croppedData = croppedCtx.getImageData(0, 0, bounds.width, bounds.height);
 
+  // PRE-TRACE SMOOTHING: Apply Gaussian blur + re-threshold to reduce stair-step edges
+  const smoothedData = smoothBinaryMask(croppedData, BLUR_SIGMA);
+  console.log('[CleanVectorizer] Applied pre-trace smoothing (sigma=' + BLUR_SIGMA + ')');
+
   // Trace with imagetracerjs
-  // Options tuned for handwriting
+  // Options tuned for handwriting (blur disabled since we handle it upstream)
   const traceOptions = {
     ltres: 1,        // Line threshold
     qtres: 2,        // Quadratic spline threshold (slightly higher for smoother curves)
@@ -116,7 +370,7 @@ export function vectorizeCell(cellImageData: ImageData): VectorizationResult {
   };
 
   try {
-    const svgString = ImageTracer.imagedataToSVG(croppedData, traceOptions);
+    const svgString = ImageTracer.imagedataToSVG(smoothedData, traceOptions);
 
     // DEBUG: Log raw SVG for inspection
     console.log('[CleanVectorizer] Raw SVG from imagetracer:', svgString.substring(0, 500));
@@ -227,14 +481,31 @@ function extractPathFromSvg(svgString: string, imageWidth: number, imageHeight: 
   }
 
   console.log(`[CleanVectorizer] Outlines: ${outlines.length}, Holes: ${holes.length}, Rejected: ${rejected.length}`);
-  console.log(`[CleanVectorizer] ===================================`);
 
   document.body.removeChild(temp);
+
+  // POST-TRACE SIMPLIFICATION: Apply Douglas-Peucker to reduce micro-vertices
+  // Apply separately to outlines and holes to preserve topology
+  const simplifiedOutlines = outlines.map(d => {
+    const before = d.length;
+    const simplified = simplifySvgPath(d, DP_EPSILON);
+    console.log(`[CleanVectorizer] Simplified outline: ${before} chars → ${simplified.length} chars`);
+    return simplified;
+  });
+
+  const simplifiedHoles = holes.map(d => {
+    const before = d.length;
+    const simplified = simplifySvgPath(d, DP_EPSILON);
+    console.log(`[CleanVectorizer] Simplified hole: ${before} chars → ${simplified.length} chars`);
+    return simplified;
+  });
+
+  console.log(`[CleanVectorizer] ===================================`);
 
   // Return structured data so PathConverter can handle winding correctly
   // Format: outlines first, then holes, separated by a marker
   // We'll use a special format that PathConverter can parse
-  return JSON.stringify({ outlines, holes });
+  return JSON.stringify({ outlines: simplifiedOutlines, holes: simplifiedHoles });
 }
 
 function isWhiteColor(color: string): boolean {
